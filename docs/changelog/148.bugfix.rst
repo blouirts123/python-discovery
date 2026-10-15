@@ -1,0 +1,2 @@
+Honor PEP 514 ExecutableArguments when interrogating registered Windows interpreters and
+distinguish launcher arguments in cached results.
