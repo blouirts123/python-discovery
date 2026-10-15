@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from subprocess import TimeoutExpired
+from subprocess import TimeoutExpired, list2cmdline
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
@@ -14,11 +14,13 @@ import pytest
 from python_discovery import DiskCache, PythonInfo
 from python_discovery._cached_py_info import (
     LogCmd,
+    _get_from_cache,
     _get_via_file_cache,
     _load_cached_py_info,
     _resolve_py_info_script,
     _run_subprocess,
     _script_hash,
+    _windows_command_line,
     gen_cookie,
 )
 
@@ -43,6 +45,47 @@ def test_log_cmd_repr_with_env() -> None:
     assert "python" in result
     assert "env of" in result
     assert "FOO" in result
+
+
+def test_windows_command_line_keeps_pep514_arguments_before_quoted_tail() -> None:
+    exe = r"C:\Program Files\Python Launcher\py.exe"
+    executable_args = '-3.11 --config "settings folder\\python.json"'
+    trailing_args = [r"C:\temporary files\collector.py", "start-cookie", "end-cookie"]
+
+    command = _windows_command_line(exe, executable_args, trailing_args)
+
+    assert command.startswith(f"{list2cmdline([exe])} ")
+    assert f" {executable_args} " in command
+    assert command.endswith(list2cmdline(trailing_args))
+
+
+def test_in_memory_cache_identity_includes_executable_arguments(tmp_path: Path, mocker: MockerFixture) -> None:
+    from collections import OrderedDict
+
+    path = tmp_path / "launcher.exe"
+    cache = DiskCache(tmp_path / "cache")
+    first = PythonInfo()
+    second = PythonInfo()
+    mocker.patch("python_discovery._cached_py_info._CACHE", OrderedDict())
+    query = mocker.patch(
+        "python_discovery._cached_py_info._get_via_file_cache",
+        side_effect=[first, second],
+    )
+
+    result_311 = _get_from_cache(
+        PythonInfo, cache, str(path), dict(os.environ), ignore_cache=False, executable_args="-3.11"
+    )
+    result_312 = _get_from_cache(
+        PythonInfo, cache, str(path), dict(os.environ), ignore_cache=False, executable_args="-3.12"
+    )
+    cached_311 = _get_from_cache(
+        PythonInfo, cache, str(path), dict(os.environ), ignore_cache=False, executable_args="-3.11"
+    )
+
+    assert result_311 is first
+    assert result_312 is second
+    assert cached_311 is first
+    assert query.call_count == 2
 
 
 def test_resolve_py_info_script_file_exists() -> None:

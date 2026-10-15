@@ -172,4 +172,4 @@ def _populate_pyinfo_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
     for _, major, minor, arch, threaded, exe in interpreters:
         info = _mock_pyinfo(major, minor, arch, exe, threaded)
-        monkeypatch.setitem(_CACHE, Path(info.executable), info)
+        monkeypatch.setitem(_CACHE, (Path(info.executable), None), info)

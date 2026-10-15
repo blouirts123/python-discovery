@@ -36,13 +36,19 @@ def propose_interpreters(
         reverse=True,
     )
 
-    for name, major, minor, arch, threaded, exe, _ in existing:
+    for name, major, minor, arch, threaded, exe, executable_args in existing:
         implementation = _IMPLEMENTATION_BY_ORG.get(name, name)
 
         skip_pre_filter = implementation.lower() != "cpython"
         registry_spec = PythonSpec("", implementation, major, minor, None, arch, exe, free_threaded=threaded)
         if skip_pre_filter or registry_spec.satisfies(spec):
-            interpreter = Pep514PythonInfo.from_exe(exe, cache, env=env, raise_on_error=False)
+            interpreter = Pep514PythonInfo._from_exe_with_args(  # ruff:ignore[private-member-access]
+                exe,
+                cache,
+                env=env,
+                executable_args=executable_args,
+                raise_on_error=False,
+            )
             if interpreter is not None and interpreter.satisfies(spec, impl_must_match=True):
                 yield interpreter
 

@@ -135,6 +135,12 @@ class DiskCache:
         key = sha256(str(path).encode("utf-8")).hexdigest()
         return DiskContentStore(self._py_info_dir, key)
 
+    def _py_info_with_args(self, path: Path, arguments: str) -> DiskContentStore:
+        """Return a distinct store when one executable is queried with launcher arguments."""
+        identity = f"{path}\0{arguments}"
+        key = sha256(identity.encode("utf-8")).hexdigest()
+        return DiskContentStore(self._py_info_dir, key)
+
     def py_info_clear(self) -> None:
         """Remove all cached interpreter information."""
         folder = self._py_info_dir

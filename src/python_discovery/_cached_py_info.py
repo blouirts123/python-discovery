@@ -17,7 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 from shlex import quote
 from subprocess import Popen, TimeoutExpired  # ruff:ignore[suspicious-subprocess-import]
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from ._cache import NoOpCache
 from ._py_info import PythonInfo
@@ -29,16 +29,17 @@ if TYPE_CHECKING:
 
     from ._cache import ContentStore, PyInfoCache
 
-    class CacheEntryMeta(TypedDict):
-        """Identity of a cached interrogation result: the queried binary and the script that produced it."""
+    class CacheEntryMeta(TypedDict, total=False):
+        """Identity of a cached interrogation result: the queried binary, arguments, and script."""
 
         st_mtime: float
         path: str
         hash: str | None
+        arguments_hash: str | None
 
 
-_CACHE: OrderedDict[Path, PythonInfo | Exception] = OrderedDict()
-_CACHE[Path(sys.executable)] = PythonInfo()
+_CACHE: OrderedDict[tuple[Path, str | None], PythonInfo | Exception] = OrderedDict()
+_CACHE[Path(sys.executable), None] = PythonInfo()
 _LOGGER: Final[logging.Logger] = logging.getLogger(__name__)
 _PY_INFO_SCRIPT: Final[Path] = Path(__file__).resolve().parent / "_py_info_collect.py"
 _DEFAULT_QUERY_TIMEOUT: Final[float] = 15.0
@@ -58,9 +59,10 @@ def from_exe(  # ruff:ignore[too-many-arguments]
     *,
     raise_on_error: bool = True,
     ignore_cache: bool = False,
+    executable_args: str | None = None,
 ) -> PythonInfo | None:
     env = os.environ if env is None else env
-    result = _get_from_cache(cls, cache, exe, env, ignore_cache=ignore_cache)
+    result = _get_from_cache(cls, cache, exe, env, ignore_cache=ignore_cache, executable_args=executable_args)
     if isinstance(result, Exception):
         if raise_on_error:
             raise result
@@ -69,31 +71,35 @@ def from_exe(  # ruff:ignore[too-many-arguments]
     return result
 
 
-def _get_from_cache(
+def _get_from_cache(  # ruff:ignore[too-many-arguments]
     cls: type[PythonInfo],
     cache: PyInfoCache | None,
     exe: str,
     env: Mapping[str, str],
     *,
     ignore_cache: bool = True,
+    executable_args: str | None = None,
 ) -> PythonInfo | Exception:
     exe_path = Path(exe)
-    if not ignore_cache and exe_path in _CACHE:
-        result = _CACHE[exe_path]
+    cache_key = (exe_path, executable_args)
+    if not ignore_cache and cache_key in _CACHE:
+        result = _CACHE[cache_key]
     else:
-        py_info = _get_via_file_cache(cls, cache, exe_path, exe, env)
-        result = _CACHE[exe_path] = py_info
-    if isinstance(result, PythonInfo):
+        py_info = _get_via_file_cache(cls, cache, exe_path, exe, env, executable_args=executable_args)
+        result = _CACHE[cache_key] = py_info
+    if isinstance(result, PythonInfo) and executable_args is None:
         result.executable = exe
     return result
 
 
-def _get_via_file_cache(
+def _get_via_file_cache(  # ruff:ignore[too-many-arguments]
     cls: type[PythonInfo],
     cache: PyInfoCache | None,
     path: Path,
     exe: str,
     env: Mapping[str, str],
+    *,
+    executable_args: str | None = None,
 ) -> PythonInfo | Exception:
     path_text = str(path)
     try:
@@ -106,18 +112,18 @@ def _get_via_file_cache(
         py_info_hash = None
 
     resolved_cache = cache if cache is not None else NoOpCache()
-    py_info_store = resolved_cache.py_info(path)
-    entry_meta: CacheEntryMeta = {"st_mtime": path_modified, "path": path_text, "hash": py_info_hash}
+    py_info_store = _cache_store(resolved_cache, path, executable_args)
+    entry_meta = _cache_entry_meta(path_modified, path_text, py_info_hash, executable_args)
     with py_info_store.locked():
         cached = _read_cache_entry(cls, py_info_store, entry_meta)
         if isinstance(cached, _UnsupportedInterpreterError):
             return cached
         py_info = cached
         if py_info is None:
-            failure, py_info = _run_subprocess(cls, exe, env)
+            failure, py_info = _run_subprocess(cls, exe, env, executable_args=executable_args)
             if failure is not None and not isinstance(failure, _UnsupportedInterpreterError):
                 _LOGGER.debug("first subprocess attempt failed for %s (%s), retrying", exe, failure)
-                failure, py_info = _run_subprocess(cls, exe, env)
+                failure, py_info = _run_subprocess(cls, exe, env, executable_args=executable_args)
             if isinstance(failure, _UnsupportedInterpreterError):
                 _LOGGER.warning("%s", failure)  # the verdict is permanent, warn once and remember it
                 py_info_store.write({**entry_meta, "unsupported": str(failure)})
@@ -130,6 +136,25 @@ def _get_via_file_cache(
         msg = f"{exe} failed to produce interpreter info"
         return RuntimeError(msg)
     return py_info
+
+
+def _cache_store(cache: PyInfoCache, path: Path, executable_args: str | None) -> ContentStore:
+    if executable_args is not None and (store_for_args := getattr(cache, "_py_info_with_args", None)) is not None:
+        return store_for_args(path, executable_args)
+    return cache.py_info(path)
+
+
+def _arguments_hash(executable_args: str) -> str:
+    return hashlib.sha256(executable_args.encode("utf-8")).hexdigest()
+
+
+def _cache_entry_meta(
+    path_modified: float, path_text: str, py_info_hash: str | None, executable_args: str | None
+) -> CacheEntryMeta:
+    entry_meta: CacheEntryMeta = {"st_mtime": path_modified, "path": path_text, "hash": py_info_hash}
+    if executable_args is not None:
+        entry_meta["arguments_hash"] = _arguments_hash(executable_args)
+    return entry_meta
 
 
 def _read_cache_entry(
@@ -214,41 +239,24 @@ def _run_subprocess(
     cls: type[PythonInfo],
     exe: str,
     env: Mapping[str, str],
+    *,
+    executable_args: str | None = None,
 ) -> tuple[Exception | None, PythonInfo | None]:
     start_cookie = gen_cookie()
     end_cookie = gen_cookie()
     timeout = _query_timeout(env.get("PY_DISCOVERY_TIMEOUT"))
     with _resolve_py_info_script() as py_info_script:
-        cmd = [exe, str(py_info_script), start_cookie, end_cookie]
-        env = dict(env)
-        env.pop("__PYVENV_LAUNCHER__", None)
-        env["PYTHONUTF8"] = "1"
-        _LOGGER.debug("get interpreter info via cmd: %s", LogCmd(cmd))
-        try:
-            process = Popen(  # ruff:ignore[subprocess-without-shell-equals-true]
-                cmd,
-                universal_newlines=True,
-                stdin=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                env=env,
-                encoding="utf-8",
-                errors="backslashreplace",
-            )
-            out, err = process.communicate(timeout=timeout)
-            code = process.returncode
-        except TimeoutExpired:
-            process.kill()
-            process.communicate()
-            out, err, code = "", "timed out", -1
-        except OSError as os_error:
-            out, err, code = "", os_error.strerror, os_error.errno
+        if executable_args is not None and os.name != "nt":
+            msg = "PEP 514 ExecutableArguments can only be used on Windows"
+            return RuntimeError(msg), None
+        out, err, code = _launch_query(exe, py_info_script, start_cookie, end_cookie, env, timeout, executable_args)
     if code != 0:
         return _query_failure(exe, out, err, code), None
     out, raw_out, out_starts, out_ends = _extract_between_cookies(out, start_cookie, end_cookie)
     try:
         result = cls.from_json(out)
-        result.executable = exe
+        if executable_args is None:
+            result.executable = exe
     except json.JSONDecodeError as exc:
         _LOGGER.warning(
             "subprocess %s returned invalid JSON; raw stdout %d chars, start cookie %s, end cookie %s, "
@@ -265,6 +273,71 @@ def _run_subprocess(
         failure.__cause__ = exc
         return failure, None
     return None, result
+
+
+def _launch_query(  # ruff:ignore[too-many-arguments, too-many-positional-arguments]
+    exe: str,
+    py_info_script: Path,
+    start_cookie: str,
+    end_cookie: str,
+    env: Mapping[str, str],
+    timeout: float | None,
+    executable_args: str | None,
+) -> tuple[str, str | None, int | None]:
+    env = dict(env)
+    env.pop("__PYVENV_LAUNCHER__", None)
+    env["PYTHONUTF8"] = "1"
+    tail = [str(py_info_script), start_cookie, end_cookie]
+    if executable_args is None:
+        raw_command = None
+        logged_command: LogCmd | str = LogCmd([exe, *tail])
+    else:
+        raw_command = _windows_command_line(exe, executable_args, tail)
+        logged_command = (
+            f"{subprocess.list2cmdline([exe])} <PEP 514 ExecutableArguments> {subprocess.list2cmdline(tail)}"
+        )
+    _LOGGER.debug("get interpreter info via cmd: %s", logged_command)
+    try:  # ruff:ignore[too-many-statements-in-try-clause]
+        if raw_command is None:
+            process: Popen[str] = Popen(  # ruff:ignore[subprocess-without-shell-equals-true]
+                [exe, *tail],
+                universal_newlines=True,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                env=env,
+                encoding="utf-8",
+                errors="backslashreplace",
+            )
+        else:
+            # Popen supports raw command-line strings on Windows, which typeshed omits here.
+            process = Popen(  # ruff:ignore[subprocess-without-shell-equals-true]
+                cast(Any, raw_command),  # ruff:ignore[runtime-cast-value]
+                universal_newlines=True,
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                env=env,
+                encoding="utf-8",
+                errors="backslashreplace",
+                executable=exe,
+            )
+        out, err = process.communicate(timeout=timeout)
+        code = process.returncode
+    except TimeoutExpired:
+        process.kill()
+        process.communicate()
+        out, err, code = "", "timed out", -1
+    except OSError as os_error:
+        out, err, code = "", os_error.strerror, os_error.errno
+    return out, err, code
+
+
+def _windows_command_line(exe: str, executable_args: str, trailing_args: list[str]) -> str:
+    """Build a Windows command line, keeping PEP 514's leading argument text intact."""
+    prefix = subprocess.list2cmdline([exe])
+    suffix = subprocess.list2cmdline(trailing_args)
+    return f"{prefix} {executable_args} {suffix}"
 
 
 @lru_cache(maxsize=128)

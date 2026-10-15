@@ -58,6 +58,18 @@ def test_disk_cache_py_info(tmp_path: Path) -> None:
     assert isinstance(store, DiskContentStore)
 
 
+def test_disk_cache_py_info_with_args_uses_a_distinct_store(tmp_path: Path) -> None:
+    cache = DiskCache(tmp_path)
+    path = Path("/some/path")
+    no_args = cache.py_info(path)
+    with_args = cache._py_info_with_args(path, "-3.11")
+    another_args = cache._py_info_with_args(path, "-3.12")
+
+    assert with_args._file != no_args._file
+    assert with_args._file != another_args._file
+    assert with_args._file == cache._py_info_with_args(path, "-3.11")._file
+
+
 def test_disk_cache_py_info_clear(tmp_path: Path) -> None:
     cache = DiskCache(tmp_path)
     store = cache.py_info(Path("/some/path"))

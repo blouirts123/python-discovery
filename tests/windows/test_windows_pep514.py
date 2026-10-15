@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
+from typing_extensions import Self
 
 
 @pytest.mark.usefixtures("_mock_registry")
@@ -154,3 +160,85 @@ def test_pep514_run(capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptur
         f"{prefix}HKEY_CURRENT_USER/PythonCore/3.X error: invalid format 3.X",
     ]
     assert caplog.messages == expected_logs
+
+
+@pytest.mark.usefixtures("_mock_registry")
+@pytest.mark.parametrize(
+    ("registered_args", "expected_args"),
+    [
+        ('-3.11 --config "settings folder\\python.json"', '-3.11 --config "settings folder\\python.json"'),
+        ("", None),
+        ("   ", None),
+        (42, False),
+    ],
+)
+def test_pep514_loads_executable_arguments(
+    monkeypatch: pytest.MonkeyPatch, registered_args: object, expected_args: str | bool | None
+) -> None:
+    from python_discovery._windows import _pep514 as pep514
+
+    class Key:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(pep514.winreg, "OpenKeyEx", lambda *_args: Key())
+    monkeypatch.setattr(pep514, "_resolve_exe", lambda *_args: r"C:\PythonLauncher\py.exe")
+    monkeypatch.setattr(pep514.os.path, "exists", lambda _path: True)
+    monkeypatch.setattr(
+        pep514,
+        "get_value",
+        lambda _key, name: registered_args if name == "ExecutableArguments" else None,
+    )
+
+    result = pep514.load_exe("HKCU", "PythonCore", object(), "3.11")
+
+    if expected_args is False:
+        assert result is None
+    else:
+        assert result == (r"C:\PythonLauncher\py.exe", expected_args)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires the Windows Python launcher")
+def test_launcher_registry_arguments_return_an_executable_for_selected_python(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from python_discovery import DiskCache, PythonSpec
+    from python_discovery._windows import _propose
+
+    launcher = shutil.which("py")
+    if launcher is None:
+        # pytest accepts a reason, but ty's bundled Python 3.9 pytest signature is stale.
+        pytest.skip("the Windows Python launcher is unavailable")  # ty: ignore[too-many-positional-arguments]
+    selector = "-3.11"
+    script = (
+        "import json, struct, sys; print(json.dumps((sys.executable, *sys.version_info[:2], struct.calcsize('P') * 8)))"
+    )
+    try:
+        selected = subprocess.run(
+            [launcher, selector, "-c", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except subprocess.CalledProcessError:
+        # pytest accepts a reason, but ty's bundled Python 3.9 pytest signature is stale.
+        pytest.skip(f"the Windows launcher cannot select {selector}")  # ty: ignore[too-many-positional-arguments]
+    selected_exe, major, minor, arch = json.loads(selected)
+    registry_row = ("PythonCore", major, minor, arch, False, launcher, selector)
+    monkeypatch.setattr(_propose, "discover_pythons", lambda: iter([registry_row]))
+
+    spec = PythonSpec.from_string_spec(f"python{major}.{minor}")
+    info = next(_propose.propose_interpreters(spec, DiskCache(tmp_path), dict(os.environ)))
+    assert info.version_info[:2] == (major, minor)
+    assert Path(info.executable).samefile(selected_exe)
+
+    actual = subprocess.run(
+        [info.executable, "-c", "import sys; print(*sys.version_info[:2])"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual == f"{major} {minor}"

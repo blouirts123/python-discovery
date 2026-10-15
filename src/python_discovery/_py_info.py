@@ -378,10 +378,41 @@ class PythonInfo:  # ruff:ignore[too-many-public-methods]
         :param resolve_to_host: resolve through virtualenv layers to the system interpreter.
         :param env: environment mapping; defaults to :data:`os.environ`.
         """
+        return cls._from_exe_with_args(
+            exe,
+            cache,
+            executable_args=None,
+            raise_on_error=raise_on_error,
+            ignore_cache=ignore_cache,
+            resolve_to_host=resolve_to_host,
+            env=env,
+        )
+
+    @classmethod
+    def _from_exe_with_args(  # ruff:ignore[too-many-arguments]
+        cls,
+        exe: str,
+        cache: PyInfoCache | None = None,
+        *,
+        executable_args: str | None,
+        raise_on_error: bool = True,
+        ignore_cache: bool = False,
+        resolve_to_host: bool = True,
+        env: Mapping[str, str] | None = None,
+    ) -> PythonInfo | None:
+        """Interrogate an executable with optional platform-specific leading arguments."""
         from ._cached_py_info import from_exe  # ruff:ignore[import-outside-top-level]
 
         env = os.environ if env is None else env
-        proposed = from_exe(cls, cache, exe, env=env, raise_on_error=raise_on_error, ignore_cache=ignore_cache)
+        proposed = from_exe(
+            cls,
+            cache,
+            exe,
+            env=env,
+            raise_on_error=raise_on_error,
+            ignore_cache=ignore_cache,
+            executable_args=executable_args,
+        )
 
         if isinstance(proposed, PythonInfo) and resolve_to_host:
             try:
