@@ -1,2 +1,2 @@
-Honor PEP 514 ExecutableArguments when interrogating registered Windows interpreters and
-distinguish launcher arguments in cached results.
+Pass PEP 514 ``ExecutableArguments`` to registered Windows interpreters when querying them, so a registration that
+points at a launcher such as ``py.exe -3.11`` reports the interpreter it selects - by :user:`blouirts123`.

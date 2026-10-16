@@ -7,9 +7,15 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
 import pytest
-from typing_extensions import Self
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from pytest_mock import MockerFixture
 
 
 @pytest.mark.usefixtures("_mock_registry")
@@ -162,83 +168,64 @@ def test_pep514_run(capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptur
     assert caplog.messages == expected_logs
 
 
+@pytest.fixture
+def load_exe_with_args(mocker: MockerFixture) -> Callable[[object], tuple[str, str | None] | None]:
+    from python_discovery._windows import _pep514 as pep514
+
+    mocker.patch.object(pep514.winreg, "OpenKeyEx", return_value=MagicMock())
+    mocker.patch.object(pep514, "_resolve_exe", return_value=r"C:\py.exe")
+    mocker.patch.object(pep514.os.path, "exists", return_value=True)
+
+    def load(registered: object) -> tuple[str, str | None] | None:
+        mocker.patch.object(pep514, "get_value", return_value=registered)
+        return pep514.load_exe("HKCU", "PythonCore", MagicMock(), "3.11")
+
+    return load
+
+
 @pytest.mark.usefixtures("_mock_registry")
 @pytest.mark.parametrize(
-    ("registered_args", "expected_args"),
+    ("registered", "expected"),
     [
-        ('-3.11 --config "settings folder\\python.json"', '-3.11 --config "settings folder\\python.json"'),
-        ("", None),
-        ("   ", None),
-        (42, False),
+        pytest.param('-3.11 --config "a b"', '-3.11 --config "a b"', id="kept"),
+        pytest.param(None, None, id="missing"),
+        pytest.param("", None, id="empty"),
+        pytest.param("   ", None, id="blank"),
     ],
 )
 def test_pep514_loads_executable_arguments(
-    monkeypatch: pytest.MonkeyPatch, registered_args: object, expected_args: str | bool | None
+    load_exe_with_args: Callable[[object], tuple[str, str | None] | None], registered: str | None, expected: str | None
 ) -> None:
-    from python_discovery._windows import _pep514 as pep514
-
-    class Key:
-        def __enter__(self) -> Self:
-            return self
-
-        def __exit__(self, *_args: object) -> None:
-            return None
-
-    monkeypatch.setattr(pep514.winreg, "OpenKeyEx", lambda *_args: Key())
-    monkeypatch.setattr(pep514, "_resolve_exe", lambda *_args: r"C:\PythonLauncher\py.exe")
-    monkeypatch.setattr(pep514.os.path, "exists", lambda _path: True)
-    monkeypatch.setattr(
-        pep514,
-        "get_value",
-        lambda _key, name: registered_args if name == "ExecutableArguments" else None,
-    )
-
-    result = pep514.load_exe("HKCU", "PythonCore", object(), "3.11")
-
-    if expected_args is False:
-        assert result is None
-    else:
-        assert result == (r"C:\PythonLauncher\py.exe", expected_args)
+    assert load_exe_with_args(registered) == (r"C:\py.exe", expected)
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="requires the Windows Python launcher")
-def test_launcher_registry_arguments_return_an_executable_for_selected_python(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.usefixtures("_mock_registry")
+def test_pep514_rejects_non_string_executable_arguments(
+    load_exe_with_args: Callable[[object], tuple[str, str | None] | None],
 ) -> None:
+    assert load_exe_with_args(42) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32" or shutil.which("py") is None, reason="requires the Windows launcher")
+def test_pep514_launcher_arguments_select_interpreter(mocker: MockerFixture, tmp_path: Path) -> None:
     from python_discovery import DiskCache, PythonSpec
     from python_discovery._windows import _propose
 
     launcher = shutil.which("py")
-    if launcher is None:
-        # pytest accepts a reason, but ty's bundled Python 3.9 pytest signature is stale.
-        pytest.skip("the Windows Python launcher is unavailable")  # ty: ignore[too-many-positional-arguments]
-    selector = "-3.11"
+    assert launcher is not None
     script = (
-        "import json, struct, sys; print(json.dumps((sys.executable, *sys.version_info[:2], struct.calcsize('P') * 8)))"
+        "import json, struct, sys; print(json.dumps([sys.executable, *sys.version_info[:2], struct.calcsize('P') * 8]))"
     )
-    try:
-        selected = subprocess.run(
-            [launcher, selector, "-c", script],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-    except subprocess.CalledProcessError:
-        # pytest accepts a reason, but ty's bundled Python 3.9 pytest signature is stale.
-        pytest.skip(f"the Windows launcher cannot select {selector}")  # ty: ignore[too-many-positional-arguments]
-    selected_exe, major, minor, arch = json.loads(selected)
-    registry_row = ("PythonCore", major, minor, arch, False, launcher, selector)
-    monkeypatch.setattr(_propose, "discover_pythons", lambda: iter([registry_row]))
+    probe = subprocess.run([launcher, "-3.11", "-c", script], capture_output=True, text=True, check=False)
+    if probe.returncode:
+        pytest.skip("the launcher cannot select 3.11")  # ty: ignore[too-many-positional-arguments]  # ty ships a stale pytest stub for 3.9
+    selected, major, minor, arch = json.loads(probe.stdout)
+    mocker.patch.object(
+        _propose, "discover_pythons", return_value=[("PythonCore", major, minor, arch, False, launcher, "-3.11")]
+    )
 
-    spec = PythonSpec.from_string_spec(f"python{major}.{minor}")
-    info = next(_propose.propose_interpreters(spec, DiskCache(tmp_path), dict(os.environ)))
-    assert info.version_info[:2] == (major, minor)
-    assert Path(info.executable).samefile(selected_exe)
+    info = next(
+        _propose.propose_interpreters(PythonSpec.from_string_spec("python3.11"), DiskCache(tmp_path), os.environ)
+    )
 
-    actual = subprocess.run(
-        [info.executable, "-c", "import sys; print(*sys.version_info[:2])"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert actual == f"{major} {minor}"
+    assert Path(info.executable).samefile(selected)

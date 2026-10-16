@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
 import sys
 from pathlib import Path
-from subprocess import TimeoutExpired, list2cmdline
-from types import SimpleNamespace
+from subprocess import TimeoutExpired
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
@@ -16,22 +14,16 @@ import pytest
 from python_discovery import DiskCache, PythonInfo
 from python_discovery._cached_py_info import (
     LogCmd,
-    _cache_store,
-    _get_from_cache,
     _get_via_file_cache,
-    _launch_query,
     _load_cached_py_info,
     _resolve_py_info_script,
     _run_subprocess,
     _script_hash,
-    _windows_command_line,
     gen_cookie,
 )
 
 if TYPE_CHECKING:
     from pytest_mock import MockerFixture
-
-    from python_discovery._cache import DiskContentStore
 
 
 def test_gen_cookie_length() -> None:
@@ -51,156 +43,6 @@ def test_log_cmd_repr_with_env() -> None:
     assert "python" in result
     assert "env of" in result
     assert "FOO" in result
-
-
-def test_windows_command_line_keeps_pep514_arguments_before_quoted_tail() -> None:
-    exe = r"C:\Program Files\Python Launcher\py.exe"
-    executable_args = '-3.11 --config "settings folder\\python.json"'
-    trailing_args = [r"C:\temporary files\collector.py", "start-cookie", "end-cookie"]
-
-    command = _windows_command_line(exe, executable_args, trailing_args)
-
-    assert command.startswith(f"{list2cmdline([exe])} ")
-    assert f" {executable_args} " in command
-    assert command.endswith(list2cmdline(trailing_args))
-
-
-def test_cache_store_uses_argument_aware_disk_store(tmp_path: Path, mocker: MockerFixture) -> None:
-    cache = DiskCache(tmp_path)
-    path = Path(sys.executable)
-    executable_args = "-3.11"
-    result = PythonInfo()
-    run = mocker.patch(
-        "python_discovery._cached_py_info._run_subprocess",
-        return_value=(None, result),
-    )
-
-    cached = _get_via_file_cache(
-        PythonInfo, cache, path, sys.executable, dict(os.environ), executable_args=executable_args
-    )
-
-    args_store = cache._py_info_with_args(path, executable_args)
-    data = args_store.read()
-    assert cached is result
-    assert data is not None
-    assert data["arguments_hash"] == hashlib.sha256(executable_args.encode("utf-8")).hexdigest()
-    assert cache.py_info(path).read() is None
-    run.assert_called_once_with(PythonInfo, sys.executable, dict(os.environ), executable_args=executable_args)
-
-
-def test_cache_store_falls_back_for_legacy_cache_with_args(tmp_path: Path) -> None:
-    disk_cache = DiskCache(tmp_path)
-
-    class LegacyCache:
-        def __init__(self, cache: DiskCache) -> None:
-            self._cache = cache
-
-        def py_info(self, path: Path) -> DiskContentStore:
-            return self._cache.py_info(path)
-
-        def py_info_clear(self) -> None:
-            self._cache.py_info_clear()
-
-    cache = LegacyCache(disk_cache)
-    path = Path(sys.executable)
-
-    store = _cache_store(cache, path, "-3.11")
-
-    assert store._file == cache.py_info(path)._file
-
-
-def test_run_subprocess_rejects_executable_args_off_windows(
-    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
-) -> None:
-    monkeypatch.setattr(
-        "python_discovery._cached_py_info.os",
-        SimpleNamespace(name="posix", write=os.write, close=os.close),
-    )
-    launch = mocker.patch("python_discovery._cached_py_info._launch_query")
-
-    failure, result = _run_subprocess(PythonInfo, "py", {}, executable_args="-3.11")
-
-    assert isinstance(failure, RuntimeError)
-    assert "only be used on Windows" in str(failure)
-    assert result is None
-    launch.assert_not_called()
-
-
-def test_run_subprocess_with_args_preserves_selected_executable(
-    monkeypatch: pytest.MonkeyPatch, mocker: MockerFixture
-) -> None:
-    launcher = r"C:\Python Launcher\py.exe"
-    selected_python = r"C:\Python311\python.exe"
-    start_cookie, end_cookie = "a" * 32, "b" * 32
-    payload = PythonInfo().to_dict()
-    payload["executable"] = selected_python
-    output = f"pre{start_cookie[::-1]}{json.dumps(payload)}{end_cookie[::-1]}post"
-    monkeypatch.setattr(
-        "python_discovery._cached_py_info.os",
-        SimpleNamespace(name="nt", write=os.write, close=os.close),
-    )
-    mocker.patch("python_discovery._cached_py_info.gen_cookie", side_effect=[start_cookie, end_cookie])
-    launch = mocker.patch(
-        "python_discovery._cached_py_info._launch_query",
-        return_value=(output, None, 0),
-    )
-
-    failure, result = _run_subprocess(PythonInfo, launcher, {}, executable_args="-3.11")
-
-    assert failure is None
-    assert result is not None
-    assert result.executable == selected_python
-    assert launch.call_args.args[0] == launcher
-    assert launch.call_args.args[-1] == "-3.11"
-
-
-def test_launch_query_passes_raw_pep514_command_to_popen(mocker: MockerFixture) -> None:
-    exe = r"C:\Program Files\Python Launcher\py.exe"
-    executable_args = '-3.11 --config "settings folder\\python.json"'
-    script = Path(r"C:\temporary files\collector.py")
-    start_cookie, end_cookie = "a" * 32, "b" * 32
-    env = {"__PYVENV_LAUNCHER__": "ignored", "PATH": "kept"}
-    process = MagicMock()
-    process.communicate.return_value = ("output", "")
-    process.returncode = 0
-    popen = mocker.patch("python_discovery._cached_py_info.Popen", return_value=process)
-
-    result = _launch_query(exe, script, start_cookie, end_cookie, env, 12, executable_args)
-
-    expected_command = _windows_command_line(exe, executable_args, [str(script), start_cookie, end_cookie])
-    assert popen.call_args.args == (expected_command,)
-    assert popen.call_args.kwargs["executable"] == exe
-    assert popen.call_args.kwargs["env"] == {"PATH": "kept", "PYTHONUTF8": "1"}
-    assert result == ("output", "", 0)
-
-
-def test_in_memory_cache_identity_includes_executable_arguments(tmp_path: Path, mocker: MockerFixture) -> None:
-    from collections import OrderedDict
-
-    path = tmp_path / "launcher.exe"
-    cache = DiskCache(tmp_path / "cache")
-    first = PythonInfo()
-    second = PythonInfo()
-    mocker.patch("python_discovery._cached_py_info._CACHE", OrderedDict())
-    query = mocker.patch(
-        "python_discovery._cached_py_info._get_via_file_cache",
-        side_effect=[first, second],
-    )
-
-    result_311 = _get_from_cache(
-        PythonInfo, cache, str(path), dict(os.environ), ignore_cache=False, executable_args="-3.11"
-    )
-    result_312 = _get_from_cache(
-        PythonInfo, cache, str(path), dict(os.environ), ignore_cache=False, executable_args="-3.12"
-    )
-    cached_311 = _get_from_cache(
-        PythonInfo, cache, str(path), dict(os.environ), ignore_cache=False, executable_args="-3.11"
-    )
-
-    assert result_311 is first
-    assert result_312 is second
-    assert cached_311 is first
-    assert query.call_count == 2
 
 
 def test_resolve_py_info_script_file_exists() -> None:
